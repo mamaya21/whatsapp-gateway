@@ -22,6 +22,45 @@ export interface Session {
   updatedAt: Date;
 }
 
+function normalizeJidToPhone(jid?: string | null): string | null {
+  if (!jid) return null;
+
+  // Ej: "51936809481@s.whatsapp.net" o "51936809481:17@s.whatsapp.net"
+  let base = jid.split("@")[0];     // "51936809481:17" o "51936809481"
+  base = base.split(":")[0];        // "51936809481"
+
+  // Nos quedamos solo con dígitos
+  let digits = base.replace(/\D/g, ""); // "51936809481"
+
+  if (!digits) return null;
+
+  // Si viene solo el celular (9 dígitos), asumimos Perú y agregamos 51
+  if (digits.length === 9) {
+    digits = "51" + digits; // "51" + "936809481" => "51936809481"
+  }
+
+  // Si tiene entre 10 y 15 dígitos lo aceptamos tal cual
+  if (digits.length >= 10 && digits.length <= 15) {
+    return digits;
+  }
+
+  // Fallback: lo devolvemos igual aunque sea raro (para no mandar null)
+  return digits;
+}
+
+function normalizePhoneToJid(phone: string): string {
+  // Quitamos cualquier cosa que no sea número (espacios, +, guiones, etc.)
+  let digits = phone.replace(/\D/g, "");
+
+  if (digits.length === 9) {
+    // Celular sin código de país -> asumimos Perú
+    digits = "51" + digits;
+  }
+
+  // En este punto digits debería ser algo tipo 51936809481
+  return `${digits}@s.whatsapp.net`;
+}
+
 const sessions: Record<string, Session> = {};
 
 async function sendWebhook(session: Session, payload: unknown) {
@@ -210,52 +249,67 @@ function handleMessagesUpsert(
   const { sessionId } = session;
   const { type, messages } = m;
 
-  if (!messages || messages.length === 0) return;
+if (!messages || messages.length === 0) return;
 
   for (const msg of messages) {
-    const fromJid = msg.key.remoteJid;
-    const isFromMe = msg.key.fromMe;
+  const { sessionId } = session;
 
-    const text =
-      msg.message?.conversation ||
-      msg.message?.extendedTextMessage?.text ||
-      msg.message?.ephemeralMessage?.message?.conversation ||
-      msg.message?.ephemeralMessage?.message?.extendedTextMessage?.text ||
-      "";
+  const remoteJid = msg.key.remoteJid;
+  const participantJid = msg.key.participant; // útil si algún día manejas grupos
+  const isFromMe = msg.key.fromMe;
 
-    if (!fromJid) continue;
+  const text =
+    msg.message?.conversation ||
+    msg.message?.extendedTextMessage?.text ||
+    msg.message?.ephemeralMessage?.message?.conversation ||
+    msg.message?.ephemeralMessage?.message?.extendedTextMessage?.text ||
+    "";
 
-    if (isFromMe) {
-      logger.debug({ sessionId, fromJid }, "Mensaje enviado por nosotros, se ignora");
-      continue;
-    }
+  if (!remoteJid) continue;
 
-    if (!text.trim()) {
-      logger.debug({ sessionId, fromJid }, "Mensaje sin texto útil, se ignora");
-      continue;
-    }
-
-    logger.info(
-      { sessionId, fromJid, text, type },
-      "Mensaje entrante recibido"
-    );
-
-    // FUTURO: aquí llamarías al webhook de n8n si session.webhookUrl existe
-    const cleanFrom = fromJid.split("@")[0];
-
-    const payload = {
-      event: "message",
-      sessionId,
-      from: cleanFrom,
-      text,
-      type,
-      messageId: msg.key.id,
-      timestamp: new Date().toISOString()
-    };
-
-    // NO usamos await. NO cambiamos async. NO bloqueamos tu código.
-    sendWebhook(session, payload);
+  if (isFromMe) {
+    logger.debug({ sessionId, remoteJid }, "Mensaje enviado por nosotros, se ignora");
+    continue;
   }
+
+  if (!text.trim()) {
+    logger.debug({ sessionId, remoteJid }, "Mensaje sin texto útil, se ignora");
+    continue;
+  }
+
+  // 1) Obtenemos el JID del remitente "real"
+  const jidForPhone = participantJid || remoteJid;
+
+  // 2) Normalizamos a número limpio con código de país
+  const fromPhone = normalizeJidToPhone(jidForPhone);
+
+  if (!fromPhone) {
+    logger.warn(
+      { sessionId, remoteJid, participantJid },
+      "No se pudo normalizar el número del remitente"
+    );
+    continue;
+  }
+
+  logger.info(
+    { sessionId, remoteJid, participantJid, fromPhone, text, type },
+    "Mensaje entrante recibido"
+  );
+
+  const payload = {
+    event: "message",
+    sessionId,
+    from: fromPhone,           // <--- AHORA SIEMPRE VA NÚMERO NORMALIZADO (ej: 51936809481)
+    text,
+    type,
+    messageId: msg.key.id,
+    remoteJid,
+    participantJid: participantJid || null,
+    timestamp: new Date().toISOString()
+  };
+
+  sendWebhook(session, payload);
+}
 }
 
 export async function sendMessageFromSession(
@@ -274,27 +328,32 @@ export async function sendMessageFromSession(
     );
   }
 
-  if (!to || !/^\d{8,15}$/.test(to)) {
-    throw new SessionError("Número de destino inválido. Usa solo dígitos con código de país.");
-  }
-
   if (!text || !text.trim()) {
     throw new SessionError("Texto del mensaje vacío o inválido.");
   }
 
-  try {
-    const jid = `${to}@s.whatsapp.net`;
+  // Normalizamos el número que viene de n8n
+  const normalizedDigits = normalizeJidToPhone(to) || to.replace(/\D/g, "");
 
+  if (!normalizedDigits || normalizedDigits.length < 8 || normalizedDigits.length > 15) {
+    throw new SessionError(
+      `Número de destino inválido después de normalizar: "${to}" -> "${normalizedDigits}"`
+    );
+  }
+
+  const jid = normalizePhoneToJid(normalizedDigits);
+
+  try {
     const res = await session.sock.sendMessage(jid, { text });
 
     logger.info(
-      { sessionId, to, text },
+      { sessionId, to: normalizedDigits, text, jid },
       "Mensaje enviado correctamente"
     );
 
     return res;
   } catch (error: any) {
-    logger.error({ sessionId, to, err: error }, "Error al enviar mensaje");
+    logger.error({ sessionId, to: normalizedDigits, jid, err: error }, "Error al enviar mensaje");
     throw new SessionError(
       `Error al enviar mensaje desde la sesión ${sessionId}: ${error?.message || error}`
     );
