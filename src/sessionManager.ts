@@ -8,6 +8,7 @@ import makeWASocket, {
 import { logger } from "./logger";
 import qrcode from "qrcode-terminal";
 import fs from "fs";
+import axios from "axios";
 
 export type SessionStatus = "starting" | "qr" | "online" | "disconnected" | "error";
 
@@ -22,6 +23,24 @@ export interface Session {
 }
 
 const sessions: Record<string, Session> = {};
+
+async function sendWebhook(session: Session, payload: unknown) {
+  if (!session.webhookUrl) return;
+
+  try {
+    await axios.post(session.webhookUrl, payload, {
+      timeout: 5000,
+      headers: {
+        "Content-Type": "application/json"
+      }
+    });
+  } catch (err) {
+    logger.error(
+      { err, sessionId: session.sessionId },
+      "Error enviando webhook a n8n"
+    );
+  }
+}
 
 export function getSessions(): Session[] {
   return Object.values(sessions);
@@ -222,6 +241,20 @@ function handleMessagesUpsert(
     );
 
     // FUTURO: aquí llamarías al webhook de n8n si session.webhookUrl existe
+    const cleanFrom = fromJid.split("@")[0];
+
+    const payload = {
+      event: "message",
+      sessionId,
+      from: cleanFrom,
+      text,
+      type,
+      messageId: msg.key.id,
+      timestamp: new Date().toISOString()
+    };
+
+    // NO usamos await. NO cambiamos async. NO bloqueamos tu código.
+    sendWebhook(session, payload);
   }
 }
 
