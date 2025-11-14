@@ -48,7 +48,9 @@ app.use(apiLimiter);
 // Body parser
 app.use(express.json());
 
-const PORT = process.env.PORT || 3000;
+// const PORT = process.env.PORT || 3000;
+const PORT = Number(process.env.PORT) || 3000;
+const HOST = process.env.HOST || "0.0.0.0";
 
 // Schemas de validación
 const StartSessionSchema = z.object({
@@ -179,8 +181,12 @@ app.use(
   }
 );
 
-app.listen(PORT, () => {
-  logger.info(`🚀 WhatsApp Gateway corriendo en http://localhost:${PORT}`);
+// app.listen(PORT, () => {
+//   logger.info(`🚀 WhatsApp Gateway corriendo en http://localhost:${PORT}`);
+// });
+
+app.listen(PORT, HOST, () => {
+  logger.info(`🚀 WhatsApp Gateway corriendo en http://${HOST}:${PORT}`);
 });
 
 app.get(
