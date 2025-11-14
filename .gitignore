@@ -1,0 +1,16 @@
+node_modules
+dist
+.env
+.env.local
+npm-debug.log*
+yarn-error.log*
+pnpm-lock.yaml
+
+# Carpeta donde Baileys guarda las sesiones (ajusta el nombre si usas otro)
+auth
+sessions
+
+# Archivos temporales / del IDE
+.DS_Store
+.idea
+.vscode
