@@ -25,27 +25,30 @@ export interface Session {
 function normalizeJidToPhone(jid?: string | null): string | null {
   if (!jid) return null;
 
-  // Ej: "51936809481@s.whatsapp.net" o "51936809481:17@s.whatsapp.net"
-  let base = jid.split("@")[0];     // "51936809481:17" o "51936809481"
-  base = base.split(":")[0];        // "51936809481"
+  const [userPart, serverPart] = jid.split("@"); // ej: "38336894881995", "lid"
 
-  // Nos quedamos solo con dígitos
-  let digits = base.replace(/\D/g, ""); // "51936809481"
+  // Si es un JID tipo LID, no lo tratamos como teléfono
+  if (serverPart === "lid") {
+    return null;                 // 👈 CLAVE: aquí decimos “no hay teléfono”
+  }
+
+  // Ej normales: s.whatsapp.net, c.us
+  let base = userPart.split(":")[0];   // p.ej "51936809481:17" -> "51936809481"
+
+  let digits = base.replace(/\D/g, "");
 
   if (!digits) return null;
 
-  // Si viene solo el celular (9 dígitos), asumimos Perú y agregamos 51
+  // Si son 9 dígitos, asumimos celular Perú
   if (digits.length === 9) {
-    digits = "51" + digits; // "51" + "936809481" => "51936809481"
+    digits = "51" + digits;
   }
 
-  // Si tiene entre 10 y 15 dígitos lo aceptamos tal cual
   if (digits.length >= 10 && digits.length <= 15) {
     return digits;
   }
 
-  // Fallback: lo devolvemos igual aunque sea raro (para no mandar null)
-  return digits;
+  return null;
 }
 
 function normalizePhoneToJid(phone: string): string {
@@ -249,67 +252,69 @@ function handleMessagesUpsert(
   const { sessionId } = session;
   const { type, messages } = m;
 
-if (!messages || messages.length === 0) return;
+  if (!messages || messages.length === 0) return;
 
   for (const msg of messages) {
-  const { sessionId } = session;
+    const remoteJid = msg.key.remoteJid;
+    const participantJid = msg.key.participant || null; // útil para grupos
+    const isFromMe = msg.key.fromMe;
 
-  const remoteJid = msg.key.remoteJid;
-  const participantJid = msg.key.participant; // útil si algún día manejas grupos
-  const isFromMe = msg.key.fromMe;
+    const text =
+      msg.message?.conversation ||
+      msg.message?.extendedTextMessage?.text ||
+      msg.message?.ephemeralMessage?.message?.conversation ||
+      msg.message?.ephemeralMessage?.message?.extendedTextMessage?.text ||
+      "";
 
-  const text =
-    msg.message?.conversation ||
-    msg.message?.extendedTextMessage?.text ||
-    msg.message?.ephemeralMessage?.message?.conversation ||
-    msg.message?.ephemeralMessage?.message?.extendedTextMessage?.text ||
-    "";
+    if (!remoteJid) continue;
 
-  if (!remoteJid) continue;
+    if (isFromMe) {
+      logger.debug(
+        { sessionId, remoteJid },
+        "Mensaje enviado por nosotros, se ignora"
+      );
+      continue;
+    }
 
-  if (isFromMe) {
-    logger.debug({ sessionId, remoteJid }, "Mensaje enviado por nosotros, se ignora");
-    continue;
-  }
+    if (!text.trim()) {
+      logger.debug(
+        { sessionId, remoteJid },
+        "Mensaje sin texto útil, se ignora"
+      );
+      continue;
+    }
 
-  if (!text.trim()) {
-    logger.debug({ sessionId, remoteJid }, "Mensaje sin texto útil, se ignora");
-    continue;
-  }
+    // 1) JID del remitente "real"
+    const jidForPhone = participantJid || remoteJid;
 
-  // 1) Obtenemos el JID del remitente "real"
-  const jidForPhone = participantJid || remoteJid;
+    // 2) Intentamos obtener número (será null para @lid)
+    const phone = normalizeJidToPhone(jidForPhone);
 
-  // 2) Normalizamos a número limpio con código de país
-  const fromPhone = normalizeJidToPhone(jidForPhone);
+    // 3) Identificador que usaremos como "from":
+    //    - Si hay número, usamos el número
+    //    - Si no hay, usamos el JID tal cual (ej: 3833...@lid)
+    const from = phone || jidForPhone;
 
-  if (!fromPhone) {
-    logger.warn(
-      { sessionId, remoteJid, participantJid },
-      "No se pudo normalizar el número del remitente"
+    logger.info(
+      { sessionId, remoteJid, participantJid, phone, from, text, type },
+      "Mensaje entrante recibido"
     );
-    continue;
+
+    const payload = {
+      event: "message",
+      sessionId,
+      from,              // puede ser número o JID (para @lid)
+      phone,             // número real o null
+      text,
+      type,
+      messageId: msg.key.id,
+      remoteJid,
+      participantJid,
+      timestamp: new Date().toISOString()
+    };
+
+    sendWebhook(session, payload);
   }
-
-  logger.info(
-    { sessionId, remoteJid, participantJid, fromPhone, text, type },
-    "Mensaje entrante recibido"
-  );
-
-  const payload = {
-    event: "message",
-    sessionId,
-    from: fromPhone,           // <--- AHORA SIEMPRE VA NÚMERO NORMALIZADO (ej: 51936809481)
-    text,
-    type,
-    messageId: msg.key.id,
-    remoteJid,
-    participantJid: participantJid || null,
-    timestamp: new Date().toISOString()
-  };
-
-  sendWebhook(session, payload);
-}
 }
 
 export async function sendMessageFromSession(
@@ -332,28 +337,37 @@ export async function sendMessageFromSession(
     throw new SessionError("Texto del mensaje vacío o inválido.");
   }
 
-  // Normalizamos el número que viene de n8n
-  const normalizedDigits = normalizeJidToPhone(to) || to.replace(/\D/g, "");
+  // --- NUEVO: aceptar número o JID ---
+  let jid: string;
 
-  if (!normalizedDigits || normalizedDigits.length < 8 || normalizedDigits.length > 15) {
-    throw new SessionError(
-      `Número de destino inválido después de normalizar: "${to}" -> "${normalizedDigits}"`
-    );
+  if (to.includes("@")) {
+    // Caso 1: n8n te envía directamente el JID (sirve para @s.whatsapp.net, @c.us, @lid, etc.)
+    jid = to;
+  } else {
+    // Caso 2: n8n te envía un número (con o sin +, espacios, etc.)
+    let digits = to.replace(/\D/g, ""); // dejamos solo números
+
+    if (!digits || digits.length < 8 || digits.length > 15) {
+      throw new SessionError(
+        `Número de destino inválido: "${to}" -> "${digits}"`
+      );
+    }
+
+    jid = `${digits}@s.whatsapp.net`;
   }
-
-  const jid = normalizePhoneToJid(normalizedDigits);
+  // --- FIN NUEVO ---
 
   try {
     const res = await session.sock.sendMessage(jid, { text });
 
     logger.info(
-      { sessionId, to: normalizedDigits, text, jid },
+      { sessionId, to, jid, text },
       "Mensaje enviado correctamente"
     );
 
     return res;
   } catch (error: any) {
-    logger.error({ sessionId, to: normalizedDigits, jid, err: error }, "Error al enviar mensaje");
+    logger.error({ sessionId, to, jid, err: error }, "Error al enviar mensaje");
     throw new SessionError(
       `Error al enviar mensaje desde la sesión ${sessionId}: ${error?.message || error}`
     );
