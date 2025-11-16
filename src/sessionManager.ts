@@ -106,12 +106,39 @@ export async function startSession(sessionId: string, webhookUrl?: string): Prom
 
   const existing = sessions[sessionId];
   if (existing) {
-    logger.debug({ sessionId }, "Sesión ya existente, devolviendo instancia");
+    logger.debug({ sessionId, status: existing.status }, "Sesión ya existente");
+
+    // Actualizamos el webhook si cambió
     if (webhookUrl && existing.webhookUrl !== webhookUrl) {
       existing.webhookUrl = webhookUrl;
       existing.updatedAt = new Date();
     }
-    return existing;
+
+    // Si la sesión está activa o en proceso de conexión, solo la devolvemos
+    if (
+      existing.status === "online" ||
+      existing.status === "qr" ||
+      existing.status === "starting"
+    ) {
+      logger.debug({ sessionId, status: existing.status }, "Sesión activa, se reutiliza");
+      return existing;
+    }
+
+    // Si llega aquí, la sesión existe pero está caída (disconnected / error)
+    logger.info(
+      { sessionId, status: existing.status },
+      "Sesión existente pero no activa, se recreará el socket"
+    );
+
+    // Cerramos el socket anterior por seguridad
+    try {
+      existing.sock.end(new Error("Reiniciando sesión caída"));
+    } catch (err) {
+      logger.warn({ sessionId, err }, "Error al cerrar socket previo al reinicio");
+    }
+
+    // IMPORTANTE: no hacemos return -> dejamos que continúe la función
+    // y cree un nuevo sock con las mismas credenciales de ./sessions/<sessionId>
   }
 
   logger.info({ sessionId }, "Iniciando nueva sesión...");
