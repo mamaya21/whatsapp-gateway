@@ -22,6 +22,125 @@ export interface Session {
   updatedAt: Date;
 }
 
+// Cache global en memoria para mapear LID -> phone (ej: 6843...@lid -> 51936809481)
+const lidToPhoneCache: Record<string, string> = {};
+
+// Archivo donde persistiremos el mapping LID -> phone
+const LID_CACHE_FILE = "./lidToPhoneCache.json";
+
+function loadLidCacheFromDisk() {
+  try {
+    if (fs.existsSync(LID_CACHE_FILE)) {
+      const raw = fs.readFileSync(LID_CACHE_FILE, "utf8");
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed === "object") {
+        Object.assign(lidToPhoneCache, parsed);
+        logger.info(
+          { entries: Object.keys(lidToPhoneCache).length },
+          "LID cache cargado desde disco"
+        );
+      }
+    }
+  } catch (err) {
+    logger.warn({ err }, "Error cargando LID cache desde disco");
+  }
+}
+
+function saveLidCacheToDisk() {
+  try {
+    fs.writeFileSync(
+      LID_CACHE_FILE,
+      JSON.stringify(lidToPhoneCache, null, 2),
+      "utf8"
+    );
+  } catch (err) {
+    logger.warn({ err }, "Error guardando LID cache en disco");
+  }
+}
+
+// Cargar cache en memoria al iniciar el módulo
+loadLidCacheFromDisk();
+
+// Último PN visto en el log "bulk device migration - loading all user devices"
+let lastBulkFromJid: string | null = null;   // ej: "51936809481@s.whatsapp.net"
+let lastBulkPhone: string | null = null;     // ej: "51936809481"
+let lastBulkSeenAt = 0;                      // timestamp (Date.now())
+
+// Hook sobre logger.debug para capturar:
+//  - mapping LID -> PN (si Baileys lo loguea)
+//  - fromJid del "bulk device migration - loading all user devices"
+const originalDebug = (logger as any).debug.bind(logger);
+
+(logger as any).debug = (arg1: any, arg2?: any, ...rest: any[]) => {
+  try {
+    const msg = typeof arg1 === "string" ? arg1 : arg2;
+    const data = typeof arg1 === "object" ? arg1 : arg2;
+
+    // 1) LID mapping explícito (si Baileys lo loguea así)
+    if (
+      msg &&
+      typeof msg === "string" &&
+      msg.includes("LID mapping already exists, skipping") &&
+      data &&
+      typeof data === "object"
+    ) {
+      const pnUser = (data as any).pnUser;
+      const lidUser = (data as any).lidUser;
+
+      if (pnUser && lidUser) {
+        const lidJid = `${lidUser}@lid`;
+        lidToPhoneCache[lidJid] = pnUser;
+
+        originalDebug(
+          {
+            ...data,
+            lidJid,
+            cachedPhone: pnUser
+          },
+          "LID mapping cache updated"
+        );
+      }
+    }
+
+    // 2) Bulk device migration: tenemos un fromJid tipo "51936809481@s.whatsapp.net"
+    if (
+      msg &&
+      typeof msg === "string" &&
+      msg.includes("bulk device migration - loading all user devices") &&
+      data &&
+      typeof data === "object"
+    ) {
+      const fromJid = (data as any).fromJid as string | undefined;
+
+      if (fromJid) {
+        // Sacamos el número normalizado a partir del fromJid (ej: 51936809481@s.whatsapp.net)
+        const phoneFromBulk =
+          normalizeJidToPhone(fromJid) || extractPhoneFromPnJid(fromJid);
+
+        if (phoneFromBulk) {
+          lastBulkFromJid = fromJid;
+          lastBulkPhone = phoneFromBulk;
+          lastBulkSeenAt = Date.now();
+
+          originalDebug(
+            {
+              ...data,
+              lastBulkFromJid,
+              lastBulkPhone,
+              lastBulkSeenAt
+            },
+            "Bulk device migration PN cached"
+          );
+        }
+      }
+    }
+  } catch {
+    // no romper el logger si algo sale mal
+  }
+
+  return originalDebug(arg1, arg2, ...rest);
+};
+
 function normalizeJidToPhone(jid?: string | null): string | null {
   if (!jid) return null;
 
@@ -62,6 +181,105 @@ function normalizePhoneToJid(phone: string): string {
 
   // En este punto digits debería ser algo tipo 51936809481
   return `${digits}@s.whatsapp.net`;
+}
+
+// --- Helpers para distinguir y extraer datos de JID ---
+
+function isPnJid(jid?: string | null): boolean {
+  return !!jid && jid.endsWith("@s.whatsapp.net");
+}
+
+function isLidJid(jid?: string | null): boolean {
+  return !!jid && jid.endsWith("@lid");
+}
+
+function extractPhoneFromPnJid(jid: string): string | null {
+  if (!isPnJid(jid)) return null;
+  const [user] = jid.split("@");
+  if (!user) return null;
+
+  // user puede venir como "51936809481:17"
+  const base = user.split(":")[0];
+  const digits = base.replace(/\D/g, "");
+
+  if (!digits) return null;
+
+  // Si son 9 dígitos, asumimos Perú
+  if (digits.length === 9) {
+    return "51" + digits;
+  }
+
+  if (digits.length >= 10 && digits.length <= 15) {
+    return digits;
+  }
+
+  return null;
+}
+
+/**
+ * Intenta resolver:
+ *  - remoteJid "usable" (idealmente PN: 51XXXXXXXXX@s.whatsapp.net)
+ *  - phone normalizado (51XXXXXXXXX) cuando sea posible
+ *
+ * No rompe nada si Baileys no tiene lidMapping ni campos Alt:
+ * simplemente devuelve lo mismo que antes (phone puede ser null).
+ */
+function resolveJidAndPhone(
+  session: Session,
+  jidForPhone: string
+): { resolvedJid: string; phone: string | null } {
+  const sock = session.sock as any; // usamos "any" para acceder a campos no tipados
+  let resolvedJid = jidForPhone;
+  let phone: string | null = null;
+
+  // 1) Caso fácil: JID ya es PN
+  if (isPnJid(jidForPhone)) {
+    resolvedJid = jidForPhone;
+    phone = extractPhoneFromPnJid(jidForPhone);
+    return { resolvedJid, phone };
+  }
+
+  // 2) Si es LID, intentamos buscar mapping PN
+  if (isLidJid(jidForPhone)) {
+    // 2.a) Primero, revisar en nuestro cache global (llenado por el logger)
+    const cachedPhone = lidToPhoneCache[jidForPhone];
+    if (cachedPhone) {
+      resolvedJid = `${cachedPhone}@s.whatsapp.net`;
+      phone = cachedPhone;
+      return { resolvedJid, phone };
+    }
+
+    // 2.b) Intentar usar el mapping interno si existe (por si en algún momento lo exponen bien)
+    const lidMapping = sock.signalRepository?.lidMapping;
+    if (lidMapping && typeof lidMapping.getPNForLID === "function") {
+      try {
+        const pnJid = lidMapping.getPNForLID(jidForPhone) as string | undefined;
+        if (pnJid && isPnJid(pnJid)) {
+          const extracted = extractPhoneFromPnJid(pnJid);
+          if (extracted) {
+            // guardamos también en cache para próximos mensajes
+            lidToPhoneCache[jidForPhone] = extracted;
+            resolvedJid = pnJid;
+            phone = extracted;
+            return { resolvedJid, phone };
+          }
+        }
+      } catch {
+        // si falla, seguimos con fallback
+      }
+    }
+
+    // 2.c) Fallback: no tenemos forma de sacar PN => mantenemos LID
+    resolvedJid = jidForPhone;
+    phone = null;
+    return { resolvedJid, phone };
+  }
+
+  // 3) Otros tipos de JID (grupos, etc.) -> comportamiento similar a antes
+  resolvedJid = jidForPhone;
+  // Intentamos usar tu helper actual como fallback
+  phone = normalizeJidToPhone(jidForPhone);
+  return { resolvedJid, phone };
 }
 
 const sessions: Record<string, Session> = {};
@@ -295,6 +513,79 @@ function handleMessagesUpsert(
 
     if (!remoteJid) continue;
 
+    // DEBUG ESPECIAL: si es LID, mostramos estructura del sock y del lidMapping
+    if (isLidJid(remoteJid)) {
+      const sockAny = session.sock as any;
+      const signalRepo = sockAny?.signalRepository;
+      const lidMapping = signalRepo?.lidMapping;
+
+      let lidMappingKeys: string[] | null = null;
+      let lidMappingSample: any = null;
+      let pnFromMapping: string | undefined = undefined;
+
+      if (lidMapping) {
+        try {
+          lidMappingKeys = Object.keys(lidMapping);
+        } catch {
+          lidMappingKeys = null;
+        }
+
+        if (typeof lidMapping.getPNForLID === "function") {
+          try {
+            pnFromMapping = lidMapping.getPNForLID(remoteJid);
+          } catch {
+            pnFromMapping = undefined;
+          }
+        }
+
+        lidMappingSample = lidMapping;
+      }
+
+      // 1) Log estructural (como antes)
+      logger.debug(
+        {
+          sessionId,
+          remoteJid,
+          sockKeys: Object.keys(sockAny || {}),
+          signalRepositoryKeys: signalRepo ? Object.keys(signalRepo) : null,
+          lidMappingKeys,
+          pnFromMapping,
+          lidMappingSample
+        },
+        "DEBUG LID SOCK & MAPPING"
+      );
+
+      // 2) Intento de inferir PN desde el último bulk device migration
+      if (lastBulkFromJid && lastBulkPhone && lastBulkSeenAt) {
+        logger.debug(
+          {
+            fromJid: lastBulkFromJid,
+            lastBulkFromJid,
+            lastBulkPhone,
+            lastBulkSeenAt
+          },
+          "Bulk device migration PN cached"
+        );
+
+        // Por ahora asumimos que el PN obtenido del bulk es el que nos sirve para este LID
+        lidToPhoneCache[remoteJid] = lastBulkPhone;
+
+        // 🔥 Guardar cache en disco para no perderlo en reinicios
+        saveLidCacheToDisk();
+
+        logger.debug(
+          {
+            sessionId,
+            remoteJid,
+            inferredFromJid: lastBulkFromJid,
+            inferredPhone: lastBulkPhone,
+            lastBulkSeenAt
+          },
+          "LID->PN mapping inferred from bulk device migration"
+        );
+      }
+    }
+
     if (isFromMe) {
       logger.debug(
         { sessionId, remoteJid },
@@ -311,31 +602,58 @@ function handleMessagesUpsert(
       continue;
     }
 
-    // 1) JID del remitente "real"
+    // 1) JID del remitente "real" (si es grupo, usar participant; si no, remoteJid)
     const jidForPhone = participantJid || remoteJid;
 
-    // 2) Intentamos obtener número (será null para @lid)
-    const phone = normalizeJidToPhone(jidForPhone);
+    // 1.5) Si el JID es LID y tenemos un PN reciente del "bulk device migration",
+    //      inferimos un mapping LID -> PN para este JID concreto.
+    if (isLidJid(jidForPhone)) {
+      const now = Date.now();
+
+      // Usamos el PN del bulk solo si fue hace poco (ej. 5 segundos)
+      if (
+        lastBulkPhone &&
+        lastBulkFromJid &&
+        now - lastBulkSeenAt < 5000 && // ventana de seguridad de 5s
+        !lidToPhoneCache[jidForPhone]
+      ) {
+        lidToPhoneCache[jidForPhone] = lastBulkPhone;
+
+        logger.debug(
+          {
+            sessionId,
+            remoteJid: jidForPhone,
+            inferredFromJid: lastBulkFromJid,
+            inferredPhone: lastBulkPhone,
+            lastBulkSeenAt
+          },
+          "LID->PN mapping inferred from bulk device migration"
+        );
+      }
+    }
+
+    // 2) Resolución mejorada: intentamos PN siempre que sea posible
+    const { resolvedJid, phone } = resolveJidAndPhone(session, jidForPhone);
 
     // 3) Identificador que usaremos como "from":
     //    - Si hay número, usamos el número
-    //    - Si no hay, usamos el JID tal cual (ej: 3833...@lid)
-    const from = phone || jidForPhone;
+    //    - Si no hay, usamos el JID resuelto (puede ser PN o LID)
+    const from = phone || resolvedJid;
 
     logger.info(
-      { sessionId, remoteJid, participantJid, phone, from, text, type },
+      { sessionId, remoteJid: resolvedJid, participantJid, phone, from, text, type },
       "Mensaje entrante recibido"
     );
 
     const payload = {
       event: "message",
       sessionId,
-      from,              // puede ser número o JID (para @lid)
-      phone,             // número real o null
+      from,                // número o JID resuelto
+      phone,               // número real o null
       text,
       type,
       messageId: msg.key.id,
-      remoteJid,
+      remoteJid: resolvedJid,
       participantJid,
       timestamp: new Date().toISOString()
     };
@@ -364,25 +682,16 @@ export async function sendMessageFromSession(
     throw new SessionError("Texto del mensaje vacío o inválido.");
   }
 
-  // --- NUEVO: aceptar número o JID ---
-  let jid: string;
+  // Siempre normalizamos "to" a número y construimos un JID PN (numero@s.whatsapp.net)
+  let digits = to.replace(/\D/g, ""); // dejamos solo números, venga como venga (número, +51..., JID, etc.)
 
-  if (to.includes("@")) {
-    // Caso 1: n8n te envía directamente el JID (sirve para @s.whatsapp.net, @c.us, @lid, etc.)
-    jid = to;
-  } else {
-    // Caso 2: n8n te envía un número (con o sin +, espacios, etc.)
-    let digits = to.replace(/\D/g, ""); // dejamos solo números
-
-    if (!digits || digits.length < 8 || digits.length > 15) {
-      throw new SessionError(
-        `Número de destino inválido: "${to}" -> "${digits}"`
-      );
-    }
-
-    jid = `${digits}@s.whatsapp.net`;
+  if (!digits || digits.length < 8 || digits.length > 15) {
+    throw new SessionError(
+      `Número de destino inválido: "${to}" -> "${digits}"`
+    );
   }
-  // --- FIN NUEVO ---
+
+  const jid = `${digits}@s.whatsapp.net`;
 
   try {
     const res = await session.sock.sendMessage(jid, { text });
