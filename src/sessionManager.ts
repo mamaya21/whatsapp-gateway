@@ -22,6 +22,11 @@ export interface Session {
   updatedAt: Date;
 }
 
+export interface SimpleButton {
+  id: string;
+  text: string;
+}
+
 // Cache global en memoria para mapear LID -> phone (ej: 6843...@lid -> 51936809481)
 const lidToPhoneCache: Record<string, string> = {};
 
@@ -665,7 +670,9 @@ function handleMessagesUpsert(
 export async function sendMessageFromSession(
   sessionId: string,
   to: string,
-  text: string
+  text?: string,
+  image?: string,
+  buttons?: SimpleButton[]
 ) {
   const session = sessions[sessionId];
   if (!session) {
@@ -678,12 +685,20 @@ export async function sendMessageFromSession(
     );
   }
 
-  if (!text || !text.trim()) {
-    throw new SessionError("Texto del mensaje vacío o inválido.");
+  // Flags
+  const hasText = !!text && text.trim().length > 0;
+  const hasImage = !!image && image.trim().length > 0;
+  const hasButtons = Array.isArray(buttons) && buttons.length > 0;
+
+  // Debe venir al menos algo
+  if (!hasText && !hasImage && !hasButtons) {
+    throw new SessionError(
+      "Debe enviar al menos texto, imagen o botones."
+    );
   }
 
-  // Siempre normalizamos "to" a número y construimos un JID PN (numero@s.whatsapp.net)
-  let digits = to.replace(/\D/g, ""); // dejamos solo números, venga como venga (número, +51..., JID, etc.)
+  // Normalizamos "to" a dígitos
+  let digits = to.replace(/\D/g, "");
 
   if (!digits || digits.length < 8 || digits.length > 15) {
     throw new SessionError(
@@ -694,16 +709,47 @@ export async function sendMessageFromSession(
   const jid = `${digits}@s.whatsapp.net`;
 
   try {
-    const res = await session.sock.sendMessage(jid, { text });
+    let res;
+
+    if (hasButtons) {
+      const btns = (buttons || []).map((b) => ({
+        buttonId: b.id,
+        buttonText: { displayText: b.text },
+        type: 1
+      }));
+
+      const messageContent: any = {
+        text: hasText ? text : "Selecciona una opción:",
+        buttons: btns,
+        headerType: 1
+      };
+
+      // 👇 casteamos a any para que no se queje el tipo AnyMessageContent
+      res = await (session.sock as any).sendMessage(jid, messageContent);
+    } else if (hasImage) {
+      // 📸 MENSAJE CON IMAGEN + CAPTION
+      res = await session.sock.sendMessage(jid, {
+        image: { url: image as string },
+        caption: hasText ? text : ""
+      });
+    } else {
+      // 💬 SOLO TEXTO
+      res = await session.sock.sendMessage(jid, {
+        text: text as string
+      });
+    }
 
     logger.info(
-      { sessionId, to, jid, text },
+      { sessionId, to, jid, text, image, buttons },
       "Mensaje enviado correctamente"
     );
 
     return res;
   } catch (error: any) {
-    logger.error({ sessionId, to, jid, err: error }, "Error al enviar mensaje");
+    logger.error(
+      { sessionId, to, jid, text, image, buttons, err: error },
+      "Error al enviar mensaje"
+    );
     throw new SessionError(
       `Error al enviar mensaje desde la sesión ${sessionId}: ${error?.message || error}`
     );

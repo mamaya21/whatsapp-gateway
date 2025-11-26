@@ -57,10 +57,31 @@ const StartSessionSchema = z.object({
   webhookUrl: z.string().url().optional()
 });
 
-const SendMessageSchema = z.object({
-  to: z.string().min(8),
-  text: z.string().min(1)
-});
+const SendMessageSchema = z
+  .object({
+    to: z.string().min(8),
+    text: z.string().optional(),   // texto opcional
+    image: z.string().optional(),  // URL de imagen opcional
+    buttons: z
+      .array(
+        z.object({
+          id: z.string().min(1),
+          text: z.string().min(1)
+        })
+      )
+      .optional()
+  })
+  .refine(
+    (data) =>
+      (data.text && data.text.trim().length > 0) ||
+      (data.image && data.image.trim().length > 0) ||
+      (data.buttons && data.buttons.length > 0),
+    {
+      message: "Debe enviar al menos texto, imagen o botones",
+      path: ["text"]
+    }
+  );
+
 
 // Endpoint de salud
 app.get("/", (_req, res) => {
@@ -135,23 +156,34 @@ app.get("/sessions", (_req, res) => {
 });
 
 // Enviar mensaje desde una sesión
+// Enviar mensaje desde una sesión
 app.post("/sessions/:sessionId/sendMessage", async (req, res, next) => {
   const { sessionId } = req.params;
   const parseResult = SendMessageSchema.safeParse(req.body || {});
 
   if (!parseResult.success) {
-    return res.status(400).json({ error: "Body inválido", details: parseResult.error.issues });
+    return res
+      .status(400)
+      .json({ error: "Body inválido", details: parseResult.error.issues });
   }
 
-  const { to, text } = parseResult.data;
+  const { to, text, image, buttons } = parseResult.data;
 
   try {
-    const result = await sendMessageFromSession(sessionId, to, text);
+    const result = await sendMessageFromSession(
+      sessionId,
+      to,
+      text,
+      image,
+      buttons
+    );
+
     res.json({ ok: true, result });
   } catch (err) {
     next(err);
   }
 });
+
 
 // Logout / limpiar sesión
 app.post("/sessions/:sessionId/logout", (req, res) => {
