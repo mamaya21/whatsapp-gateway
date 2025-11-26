@@ -69,19 +69,22 @@ const SendMessageSchema = z
           text: z.string().min(1)
         })
       )
-      .optional()
+      .optional(),
+
+    // NUEVO → opciones del poll
+    pollOptions: z.array(z.string().min(1)).optional()
   })
   .refine(
     (data) =>
       (data.text && data.text.trim().length > 0) ||
       (data.image && data.image.trim().length > 0) ||
-      (data.buttons && data.buttons.length > 0),
+      (data.buttons && data.buttons.length > 0) ||
+      (data.pollOptions && data.pollOptions.length > 0),
     {
-      message: "Debe enviar al menos texto, imagen o botones",
+      message: "Debe enviar al menos texto, imagen, botones o pollOptions.",
       path: ["text"]
     }
   );
-
 
 // Endpoint de salud
 app.get("/", (_req, res) => {
@@ -156,7 +159,6 @@ app.get("/sessions", (_req, res) => {
 });
 
 // Enviar mensaje desde una sesión
-// Enviar mensaje desde una sesión
 app.post("/sessions/:sessionId/sendMessage", async (req, res, next) => {
   const { sessionId } = req.params;
   const parseResult = SendMessageSchema.safeParse(req.body || {});
@@ -167,7 +169,7 @@ app.post("/sessions/:sessionId/sendMessage", async (req, res, next) => {
       .json({ error: "Body inválido", details: parseResult.error.issues });
   }
 
-  const { to, text, image, buttons } = parseResult.data;
+  const { to, text, image, buttons, pollOptions } = parseResult.data;
 
   try {
     const result = await sendMessageFromSession(
@@ -175,7 +177,8 @@ app.post("/sessions/:sessionId/sendMessage", async (req, res, next) => {
       to,
       text,
       image,
-      buttons
+      buttons,
+      pollOptions
     );
 
     res.json({ ok: true, result });
@@ -183,7 +186,6 @@ app.post("/sessions/:sessionId/sendMessage", async (req, res, next) => {
     next(err);
   }
 });
-
 
 // Logout / limpiar sesión
 app.post("/sessions/:sessionId/logout", (req, res) => {

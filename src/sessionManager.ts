@@ -672,87 +672,86 @@ export async function sendMessageFromSession(
   to: string,
   text?: string,
   image?: string,
-  buttons?: SimpleButton[]
+  buttons?: SimpleButton[],
+  pollOptions?: string[]
 ) {
   const session = sessions[sessionId];
-  if (!session) {
-    throw new SessionError(`Sesión ${sessionId} no existe`);
-  }
+  if (!session) throw new SessionError(`Sesión ${sessionId} no existe`);
 
   if (session.status !== "online") {
-    throw new SessionError(
-      `Sesión ${sessionId} no está online, estado actual: ${session.status}`
-    );
+    throw new SessionError(`Sesión ${sessionId} no está online`);
   }
 
   // Flags
   const hasText = !!text && text.trim().length > 0;
-  const hasImage = !!image && image.trim().length > 0;
+  const hasImage = !!image;
   const hasButtons = Array.isArray(buttons) && buttons.length > 0;
+  const hasPoll = Array.isArray(pollOptions) && pollOptions.length > 0;
 
-  // Debe venir al menos algo
-  if (!hasText && !hasImage && !hasButtons) {
-    throw new SessionError(
-      "Debe enviar al menos texto, imagen o botones."
-    );
+  if (!hasText && !hasImage && !hasButtons && !hasPoll) {
+    throw new SessionError("Debe enviar texto, imagen, botones o poll.");
   }
 
-  // Normalizamos "to" a dígitos
-  let digits = to.replace(/\D/g, "");
-
-  if (!digits || digits.length < 8 || digits.length > 15) {
-    throw new SessionError(
-      `Número de destino inválido: "${to}" -> "${digits}"`
-    );
-  }
-
+  // Normaliza número
+  const digits = to.replace(/\D/g, "");
+  if (!digits) throw new SessionError(`Número destino inválido: "${to}"`);
   const jid = `${digits}@s.whatsapp.net`;
 
   try {
     let res;
 
-    if (hasButtons) {
-      const btns = (buttons || []).map((b) => ({
-        buttonId: b.id,
-        buttonText: { displayText: b.text },
-        type: 1
+    // 🟦 PRIORIDAD: POLL
+    if (hasPoll) {
+      res = await (session.sock as any).sendMessage(jid, {
+        poll: {
+          name: hasText ? text! : "Selecciona una opción",
+          values: pollOptions,
+          selectableOptionsCount: 1
+        }
+      });
+
+    // 🟩 Botones (si vuelven a funcionar en el futuro)
+    } else if (hasButtons) {
+      const btns = (buttons || []).map((b, i) => ({
+        index: i + 1,
+        quickReplyButton: {
+          displayText: b.text,
+          id: b.id
+        }
       }));
 
-      const messageContent: any = {
-        text: hasText ? text : "Selecciona una opción:",
-        buttons: btns,
-        headerType: 1
-      };
+      res = await (session.sock as any).sendMessage(jid, {
+        text: text || "",
+        footer: " ",
+        templateButtons: btns
+      });
 
-      // 👇 casteamos a any para que no se queje el tipo AnyMessageContent
-      res = await (session.sock as any).sendMessage(jid, messageContent);
+    // 🟧 Imagen
     } else if (hasImage) {
-      // 📸 MENSAJE CON IMAGEN + CAPTION
       res = await session.sock.sendMessage(jid, {
         image: { url: image as string },
-        caption: hasText ? text : ""
+        caption: text || ""
       });
+
+    // 🟨 Solo texto (aquí forzamos `text` a string)
     } else {
-      // 💬 SOLO TEXTO
       res = await session.sock.sendMessage(jid, {
-        text: text as string
+        text: text as string   // 👈 FIX: assert porque sabemos que hay texto
       });
     }
 
     logger.info(
-      { sessionId, to, jid, text, image, buttons },
+      { sessionId, to, jid, text, image, buttons, pollOptions },
       "Mensaje enviado correctamente"
     );
 
     return res;
   } catch (error: any) {
     logger.error(
-      { sessionId, to, jid, text, image, buttons, err: error },
+      { sessionId, to, jid, text, image, buttons, pollOptions, err: error },
       "Error al enviar mensaje"
     );
-    throw new SessionError(
-      `Error al enviar mensaje desde la sesión ${sessionId}: ${error?.message || error}`
-    );
+    throw new SessionError(`Error al enviar mensaje: ${error?.message}`);
   }
 }
 
