@@ -19,6 +19,8 @@ dotenv.config();
 
 const app = express();
 
+app.use('/evidencias', express.static('/var/www/whatsapp-gateway/evidencias'));
+
 // Seguridad básica
 app.use(helmet());
 

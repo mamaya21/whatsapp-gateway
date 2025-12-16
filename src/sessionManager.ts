@@ -9,6 +9,9 @@ import { logger } from "./logger";
 import qrcode from "qrcode-terminal";
 import fs from "fs";
 import axios from "axios";
+import path from "path";
+import crypto from "crypto";
+import { downloadMediaMessage } from "@whiskeysockets/baileys";
 
 export type SessionStatus = "starting" | "qr" | "online" | "disconnected" | "error";
 
@@ -599,13 +602,33 @@ function handleMessagesUpsert(
       continue;
     }
 
-    if (!text.trim()) {
-      logger.debug(
-        { sessionId, remoteJid },
-        "Mensaje sin texto útil, se ignora"
-      );
+    const m0 =
+      msg.message?.ephemeralMessage?.message ??
+      msg.message ??
+      {};
+
+    const hasText =
+      !!m0.conversation ||
+      !!m0.extendedTextMessage?.text;
+
+    const hasImage = !!m0.imageMessage;
+    const hasDoc = !!m0.documentMessage;
+
+    // Solo ignorar si NO hay texto y NO hay media
+    if (!hasText && !hasImage && !hasDoc) {
+      logger.debug({ sessionId, remoteJid }, "Mensaje sin texto útil, se ignora");
       continue;
     }
+
+    const messageType = hasImage ? "image" : hasDoc ? "document" : "text";
+
+    // if (!text.trim()) {
+    //   logger.debug(
+    //     { sessionId, remoteJid },
+    //     "Mensaje sin texto útil, se ignora"
+    //   );
+    //   continue;
+    // }
 
     // 1) JID del remitente "real" (si es grupo, usar participant; si no, remoteJid)
     const jidForPhone = participantJid || remoteJid;
@@ -655,8 +678,9 @@ function handleMessagesUpsert(
       sessionId,
       from,                // número o JID resuelto
       phone,               // número real o null
-      text,
-      type,
+      text: text || "",
+      type: messageType,
+      eventType: type,
       messageId: msg.key.id,
       remoteJid: resolvedJid,
       participantJid,
