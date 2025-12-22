@@ -30,6 +30,9 @@ export interface SimpleButton {
   text: string;
 }
 
+const seenMsgIds = new Map<string, number>(); // id -> timestamp
+const SEEN_TTL_MS = 5 * 60 * 1000; // 5 min
+
 // Cache global en memoria para mapear LID -> phone (ej: 6843...@lid -> 51936809481)
 const lidToPhoneCache: Record<string, string> = {};
 
@@ -290,6 +293,52 @@ function resolveJidAndPhone(
   return { resolvedJid, phone };
 }
 
+function getEvidenciasDir() {
+  return process.env.EVIDENCIAS_DIR || "/var/www/whatsapp-gateway/evidencias";
+}
+
+function getPublicBaseUrl() {
+  // en local será http://localhost:3000
+  return process.env.PUBLIC_BASE_URL || "http://localhost:3000";
+}
+
+async function saveIncomingImageAndGetUrl(session: Session, msg: any, m0: any) {
+  const evidDir = path.join(
+    getEvidenciasDir(),
+    session.sessionId
+  );
+  fs.mkdirSync(evidDir, { recursive: true });
+
+  const imgMsg = m0?.imageMessage;
+  const mime = imgMsg?.mimetype || "image/jpeg";
+  const ext =
+    mime.includes("png") ? "png" :
+    mime.includes("webp") ? "webp" :
+    mime.includes("gif") ? "gif" : "jpg";
+
+  const messageId = msg?.key?.id || crypto.randomUUID();
+  const fileName = `${session.sessionId}_${messageId}.${ext}`;
+  const filePath = path.join(evidDir, fileName);
+
+  // descarga binaria desde WhatsApp
+  const buffer = await downloadMediaMessage(
+    msg,
+    "buffer",
+    {},
+    {
+      reuploadRequest: session.sock.updateMediaMessage,
+      logger: session.sock.logger
+    }
+  );
+
+  fs.writeFileSync(filePath, buffer as Buffer);
+
+  const mediaUrl = `${getPublicBaseUrl()}/evidencias/${fileName}`;
+
+  return { fileName, filePath, mediaUrl, mime, bytes: imgMsg?.fileLength || null };
+}
+
+
 const sessions: Record<string, Session> = {};
 
 async function sendWebhook(session: Session, payload: unknown) {
@@ -377,7 +426,8 @@ export async function startSession(sessionId: string, webhookUrl?: string): Prom
       auth: state,
       version,
       printQRInTerminal: false,
-      logger
+      logger,
+      shouldSyncHistoryMessage: () => false
     });
 
     const session: Session = {
@@ -399,7 +449,7 @@ export async function startSession(sessionId: string, webhookUrl?: string): Prom
     });
 
     sock.ev.on("messages.upsert", (m) => {
-      handleMessagesUpsert(session, m);
+      void handleMessagesUpsert(session, m);
     });
 
     return session;
@@ -498,28 +548,88 @@ function handleConnectionUpdate(
 }
 
 
-function handleMessagesUpsert(
+async function handleMessagesUpsert(
   session: Session,
   m: BaileysEventMap["messages.upsert"]
 ) {
   const { sessionId } = session;
   const { type, messages } = m;
 
+  logger.debug(
+    {
+      sessionId: session.sessionId,
+      upsertType: m.type,
+      messagesCount: m.messages?.length ?? 0,
+    },
+    "UPSERT ENTRY"
+  );
+  
+  if (!["notify", "append", "replace"].includes(type)) return;
+
   if (!messages || messages.length === 0) return;
 
   for (const msg of messages) {
+    // ---- DEDUPE (PASO 2) ----
+    const msgId = msg.key?.id;
+    if (msgId) {
+      const now = Date.now();
+
+      // limpiar IDs viejos (TTL)
+      for (const [id, ts] of seenMsgIds) {
+        if (now - ts > SEEN_TTL_MS) {
+          seenMsgIds.delete(id);
+        }
+      }
+
+      // si ya vimos este mensaje, lo ignoramos
+      if (seenMsgIds.has(msgId)) {
+        logger.debug({ sessionId, msgId, type }, "Duplicate message ignored");
+        continue;
+      }
+
+      // marcar como visto
+      seenMsgIds.set(msgId, now);
+    }
+    // ---- FIN DEDUPE ----
+
     const remoteJid = msg.key.remoteJid;
     const participantJid = msg.key.participant || null; // útil para grupos
     const isFromMe = msg.key.fromMe;
 
+    const root = msg.message as any;
+
+    const m0 =
+      root?.ephemeralMessage?.message ??
+      root?.viewOnceMessage?.message ??
+      root?.viewOnceMessageV2?.message ??
+      root?.viewOnceMessageV2Extension?.message ??
+      root?.documentWithCaptionMessage?.message ??   // 👈 NUEVO
+      root ?? {};
+
     const text =
-      msg.message?.conversation ||
-      msg.message?.extendedTextMessage?.text ||
-      msg.message?.ephemeralMessage?.message?.conversation ||
-      msg.message?.ephemeralMessage?.message?.extendedTextMessage?.text ||
+      m0?.conversation ||
+      m0?.extendedTextMessage?.text ||
+      m0?.imageMessage?.caption ||
+      m0?.documentMessage?.caption ||
       "";
 
     if (!remoteJid) continue;
+
+    logger.debug(
+      {
+        sessionId,
+        upsertType: type,
+        remoteJid,
+        participantJid,
+        id: msg.key.id,
+        messageKeys: Object.keys((msg.message as any) || {}),
+        hasImageDirect: !!(msg.message as any)?.imageMessage,
+        hasImageEphemeral: !!(msg.message as any)?.ephemeralMessage?.message?.imageMessage,
+        hasImageViewOnce: !!(msg.message as any)?.viewOnceMessageV2?.message?.imageMessage,
+        hasDocWithCaption: !!(msg.message as any)?.documentWithCaptionMessage
+      },
+      "UPSERT RAW SHAPE"
+    );
 
     // DEBUG ESPECIAL: si es LID, mostramos estructura del sock y del lidMapping
     if (isLidJid(remoteJid)) {
@@ -602,17 +712,26 @@ function handleMessagesUpsert(
       continue;
     }
 
-    const m0 =
-      msg.message?.ephemeralMessage?.message ??
-      msg.message ??
-      {};
-
     const hasText =
       !!m0.conversation ||
       !!m0.extendedTextMessage?.text;
 
     const hasImage = !!m0.imageMessage;
     const hasDoc = !!m0.documentMessage;
+
+    logger.debug(
+      {
+        sessionId,
+        type,
+        remoteJid,
+        id: msg.key.id,
+        messageKeys: Object.keys((msg.message as any) || {}),
+        hasImageDirect: !!(msg.message as any)?.imageMessage,
+        hasImageEphemeral: !!(msg.message as any)?.ephemeralMessage?.message?.imageMessage,
+        hasImageViewOnce: !!(msg.message as any)?.viewOnceMessageV2?.message?.imageMessage
+      },
+      "UPSERT RAW SHAPE"
+    );
 
     // Solo ignorar si NO hay texto y NO hay media
     if (!hasText && !hasImage && !hasDoc) {
@@ -629,6 +748,45 @@ function handleMessagesUpsert(
     //   );
     //   continue;
     // }
+
+    let mediaUrl: string | null = null;
+    let mimeType: string | null = null;
+    let bytes: number | null = null;
+
+    if (messageType === "image") {
+      const imgMsg = (m0 as any)?.imageMessage;
+
+      mimeType = imgMsg?.mimetype || null;
+      bytes = imgMsg?.fileLength || null;
+
+      logger.info(
+        {
+          sessionId,
+          messageId: msg.key.id,
+          mimeType,
+          bytes,
+          hasUrl: !!imgMsg?.url,
+          hasDirectPath: !!imgMsg?.directPath
+        },
+        "Imagen detectada correctamente (sin guardar aún)"
+      );
+
+      try {
+        const saved = await saveIncomingImageAndGetUrl(session, msg, m0);
+
+        mediaUrl = saved.mediaUrl;
+        mimeType = saved.mime;
+        bytes = saved.bytes;
+
+        logger.info(
+          { sessionId, messageId: msg.key.id, mediaUrl, filePath: saved.filePath },
+          "Imagen guardada en evidencias"
+        );
+      } catch (err) {
+        logger.error({ sessionId, err }, "Error guardando imagen en evidencias");
+      }
+
+    }
 
     // 1) JID del remitente "real" (si es grupo, usar participant; si no, remoteJid)
     const jidForPhone = participantJid || remoteJid;
@@ -673,18 +831,33 @@ function handleMessagesUpsert(
       "Mensaje entrante recibido"
     );
 
+    // const payload = {
+    //   event: "message",
+    //   sessionId,
+    //   from,              
+    //   phone,              
+    //   text: text || "",
+    //   type: messageType,
+    //   eventType: type,
+    //   messageId: msg.key.id,
+    //   remoteJid: resolvedJid,
+    //   participantJid,
+    //   timestamp: new Date().toISOString()
+    // };
+
     const payload = {
       event: "message",
       sessionId,
-      from,                // número o JID resuelto
-      phone,               // número real o null
-      text: text || "",
-      type: messageType,
+      from,
+      phone,
+      type: messageType,      // "image"
       eventType: type,
       messageId: msg.key.id,
       remoteJid: resolvedJid,
       participantJid,
-      timestamp: new Date().toISOString()
+      timestamp: new Date().toISOString(),
+
+      ...(hasText && { text }),   // 👈 SOLO si hay texto
     };
 
     sendWebhook(session, payload);
