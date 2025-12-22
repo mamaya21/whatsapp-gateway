@@ -19,8 +19,8 @@ dotenv.config();
 
 const app = express();
 
-//app.use('/evidencias', express.static('/var/www/whatsapp-gateway/evidencias'));
-app.use("/evidencias", express.static(process.env.EVIDENCIAS_DIR || "/var/www/whatsapp-gateway/evidencias"));
+app.use('/evidencias', express.static('/var/www/whatsapp-gateway/evidencias'));
+//app.use("/evidencias", express.static(process.env.EVIDENCIAS_DIR || "/var/www/whatsapp-gateway/evidencias"));
 
 
 // Seguridad básica
